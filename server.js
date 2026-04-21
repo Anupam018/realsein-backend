@@ -1,0 +1,220 @@
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require("@supabase/supabase-js");
+
+const app = express();
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// ─── Webhook route (MUST be before express.json()) ─────────────────────────
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const sig = req.headers["stripe-signature"];
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      console.error("⚠️  Webhook signature verification failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the event
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        console.log("✅ Payment successful for:", session.metadata);
+
+        // Fetch subscription period details from Stripe
+        let periodStart = null;
+        let periodEnd = null;
+        if (session.subscription) {
+          try {
+            const stripeSub = await stripe.subscriptions.retrieve(session.subscription);
+            periodStart = new Date(stripeSub.current_period_start * 1000).toISOString();
+            periodEnd = new Date(stripeSub.current_period_end * 1000).toISOString();
+          } catch (e) {
+            console.error("⚠️  Could not fetch subscription period:", e.message);
+          }
+        }
+
+        const now = new Date().toISOString();
+        await supabase.from("subscriptions").insert({
+          user_id: session.metadata.user_id,
+          coach_id: session.metadata.coach_id,
+          coach_plan_id: session.metadata.plan_uuid || null,
+          stripe_subscription_id: session.subscription,
+          stripe_customer_id: session.customer,
+          stripe_checkout_session_id: session.id,
+          status: "active",
+          current_period_start: periodStart,
+          current_period_end: periodEnd,
+          cancel_at_period_end: false,
+          created_at: now,
+          updated_at: now,
+        });
+        break;
+      }
+
+      case "customer.subscription.updated": {
+        const sub = event.data.object;
+        console.log("🔄 Subscription updated:", sub.id, "→", sub.status);
+
+        await supabase
+          .from("subscriptions")
+          .update({ status: sub.status, updated_at: new Date().toISOString() })
+          .eq("stripe_subscription_id", sub.id);
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        console.log("❌ Subscription cancelled:", sub.id);
+
+        await supabase
+          .from("subscriptions")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .eq("stripe_subscription_id", sub.id);
+        break;
+      }
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    res.json({ received: true });
+  }
+);
+
+// ─── Middleware ─────────────────────────────────────────────────────────────
+app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(express.json());
+
+// ─── Route 1: Create Checkout Session ──────────────────────────────────────
+app.post("/api/stripe/create-checkout-session", async (req, res) => {
+  const { userId, coachId, planId, planName, priceAmount, planUuid } = req.body;
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      mode: "subscription",
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: { name: `${planName} — RealSein Companion` },
+            unit_amount: Math.round(priceAmount * 100), // convert to cents
+            recurring: {
+              interval: planId === "wk" || planId === "weekly" ? "week" : "month",
+            },
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        user_id: userId,
+        coach_id: coachId,
+        plan_id: planId,
+        plan_uuid: planUuid || "",
+      },
+      success_url: `${process.env.FRONTEND_URL}/SubscriptionSuccess?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL}/ChoosePlan`,
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("❌ Checkout session error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Route 2: Coach Stripe Connect Onboarding ─────────────────────────────
+app.post("/api/stripe/connect-account", async (req, res) => {
+  const { coachId, email } = req.body;
+
+  try {
+    // Create a Stripe Express connected account for the coach
+    const account = await stripe.accounts.create({
+      type: "express",
+      email,
+      metadata: { coach_id: coachId },
+      capabilities: {
+        card_payments: { requested: true },
+        transfers: { requested: true },
+      },
+    });
+
+    // Save the Stripe account ID to Supabase
+    await supabase
+      .from("coach_profiles")
+      .update({ stripe_account_id: account.id })
+      .eq("id", coachId);
+
+    // Generate an onboarding link
+    const accountLink = await stripe.accountLinks.create({
+      account: account.id,
+      refresh_url: `${process.env.FRONTEND_URL}/PayoutSetup`,
+      return_url: `${process.env.FRONTEND_URL}/FinalReview`,
+      type: "account_onboarding",
+    });
+
+    res.json({ url: accountLink.url });
+  } catch (err) {
+    console.error("❌ Connect account error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Route 3: Check Subscription Status ───────────────────────────────────
+app.get("/api/subscription/status", async (req, res) => {
+  const { userId, coachId } = req.query;
+
+  const { data, error } = await supabase
+    .from("subscriptions")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("coach_id", coachId)
+    .eq("status", "active")
+    .single();
+
+  if (error || !data) {
+    return res.json({ active: false });
+  }
+
+  res.json({ active: true, subscription: data });
+});
+
+// ─── Route 4: Coach Connect Dashboard Link ────────────────────────────────
+app.post("/api/stripe/connect-dashboard", async (req, res) => {
+  const { stripeAccountId } = req.body;
+
+  try {
+    const loginLink = await stripe.accounts.createLoginLink(stripeAccountId);
+    res.json({ url: loginLink.url });
+  } catch (err) {
+    console.error("❌ Dashboard link error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Health Check ─────────────────────────────────────────────────────────
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+// ─── Start Server ─────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`🚀 RealSein backend running on port ${PORT}`);
+  console.log(`   Health check: http://localhost:${PORT}/api/health`);
+});
