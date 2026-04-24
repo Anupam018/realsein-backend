@@ -40,16 +40,20 @@ app.post(
         let periodEnd = null;
         if (session.subscription) {
           try {
-            const stripeSub = await stripe.subscriptions.retrieve(session.subscription);
+            // Fetch period details AND set to cancel at period end (no auto-renewal)
+            const stripeSub = await stripe.subscriptions.update(session.subscription, {
+              cancel_at_period_end: true,
+            });
             periodStart = new Date(stripeSub.current_period_start * 1000).toISOString();
             periodEnd = new Date(stripeSub.current_period_end * 1000).toISOString();
+            console.log("📅 Subscription set to cancel at period end:", periodEnd);
           } catch (e) {
-            console.error("⚠️  Could not fetch subscription period:", e.message);
+            console.error("⚠️  Could not update subscription:", e.message);
           }
         }
 
         const now = new Date().toISOString();
-        await supabase.from("subscriptions").insert({
+        const insertData = {
           user_id: session.metadata.user_id,
           coach_id: session.metadata.coach_id,
           coach_plan_id: session.metadata.plan_uuid || null,
@@ -59,10 +63,31 @@ app.post(
           status: "active",
           current_period_start: periodStart,
           current_period_end: periodEnd,
-          cancel_at_period_end: false,
+          cancel_at_period_end: true,
           created_at: now,
           updated_at: now,
-        });
+        };
+        await supabase.from("subscriptions").insert(insertData);
+
+        // Always record the payment in the payments table
+        const paymentInsert = {
+          user_id: session.metadata.user_id,
+          coach_id: session.metadata.coach_id,
+          coach_plan_id: session.metadata.plan_uuid || null,
+          plan_name: session.metadata.plan_name || "Subscription",
+          amount: session.amount_total ? Math.round(session.amount_total / 100) : 0,
+          provider: "stripe",
+          provider_payment_id: session.payment_intent || session.invoice || session.id,
+          payment_status: "completed",
+          currency: session.currency || "usd",
+        };
+        console.log("💳 Inserting payment record:", paymentInsert);
+        const { data: payResult, error: payError } = await supabase.from("payments").insert(paymentInsert).select();
+        if (payError) {
+          console.error("❌ Payment insert FAILED:", payError);
+        } else {
+          console.log("✅ Payment insert SUCCESS:", payResult);
+        }
         break;
       }
 
@@ -97,7 +122,10 @@ app.post(
 );
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
-app.use(cors({ origin: process.env.FRONTEND_URL }));
+app.use(cors({
+  origin: process.env.FRONTEND_URL,
+  credentials: true
+}));
 app.use(express.json());
 
 // ─── Route 1: Create Checkout Session ──────────────────────────────────────
@@ -126,6 +154,7 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
         coach_id: coachId,
         plan_id: planId,
         plan_uuid: planUuid || "",
+        plan_name: planName || "",
       },
       success_url: `${process.env.FRONTEND_URL}/SubscriptionSuccess?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL}/ChoosePlan`,
@@ -214,7 +243,7 @@ app.get("/api/health", (req, res) => {
 
 // ─── Start Server ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
+
 app.listen(PORT, () => {
-  console.log(`🚀 RealSein backend running on port ${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/api/health`);
+  console.log(`🚀 Server running on port ${PORT}`);
 });
