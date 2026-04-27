@@ -173,21 +173,33 @@ app.post("/api/stripe/connect-account", async (req, res) => {
 
   try {
     // Create a Stripe Express connected account for the coach
-    const account = await stripe.accounts.create({
-      type: "express",
-      email,
-      metadata: { coach_id: coachId },
-      capabilities: {
-        card_payments: { requested: true },
-        transfers: { requested: true },
-      },
-    });
-
-    // Save the Stripe account ID to Supabase
-    await supabase
+    // check if already exists
+    const { data } = await supabase
       .from("coach_profiles")
-      .update({ stripe_account_id: account.id })
-      .eq("id", coachId);
+      .select("stripe_account_id")
+      .eq("id", coachId)
+      .single();
+
+    let accountId = data?.stripe_account_id;
+
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: "express",
+        email,
+        metadata: { coach_id: coachId },
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+      });
+
+      account: accountId,
+
+      await supabase
+        .from("coach_profiles")
+        .update({ stripe_account_id: accountId })
+        .eq("id", coachId);
+    }
 
     // Generate an onboarding link
     const accountLink = await stripe.accountLinks.create({
@@ -232,6 +244,37 @@ app.post("/api/stripe/connect-dashboard", async (req, res) => {
     res.json({ url: loginLink.url });
   } catch (err) {
     console.error("❌ Dashboard link error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Route 5: Check Stripe Account Status ─────────────────────────────
+app.post("/api/stripe/account-status", async (req, res) => {
+  const { coachId } = req.body;
+
+  try {
+    // 1. Get stripe_account_id from DB
+    const { data, error } = await supabase
+      .from("coach_profiles")
+      .select("stripe_account_id")
+      .eq("id", coachId)
+      .single();
+
+    if (error || !data?.stripe_account_id) {
+      return res.status(400).json({ error: "Stripe account not found" });
+    }
+
+    // 2. Fetch from Stripe
+    const account = await stripe.accounts.retrieve(data.stripe_account_id);
+
+    res.json({
+      payouts_enabled: account.payouts_enabled,
+      charges_enabled: account.charges_enabled,
+      details_submitted: account.details_submitted,
+    });
+
+  } catch (err) {
+    console.error("❌ Account status error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
