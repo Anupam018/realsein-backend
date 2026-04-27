@@ -205,7 +205,7 @@ app.post("/api/stripe/connect-account", async (req, res) => {
     const accountLink = await stripe.accountLinks.create({
       account: account.id,
       refresh_url: `${process.env.FRONTEND_URL}/PayoutSetup`,
-      return_url: `${process.env.FRONTEND_URL}/FinalReview`,
+      return_url: `${process.env.FRONTEND_URL}/PayoutSetup`,
       type: "account_onboarding",
     });
 
