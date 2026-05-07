@@ -235,6 +235,55 @@ app.get("/api/subscription/status", async (req, res) => {
   res.json({ active: true, subscription: data });
 });
 
+// ─── Route 3b: Auto-Expire Subscriptions ──────────────────────────────────
+app.post("/api/subscription/expire-check", async (req, res) => {
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    // Step 1: Find expired active subscriptions for this user
+    const { data: expired, error: selectError } = await supabase
+      .from("subscriptions")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("status", "active")
+      .lt("current_period_end", now);
+
+    if (selectError) {
+      console.error("❌ Expire check select error:", selectError);
+      return res.status(500).json({ error: selectError.message });
+    }
+
+    if (!expired || expired.length === 0) {
+      return res.json({ expired: 0, subscriptions: [] });
+    }
+
+    // Step 2: Update each expired subscription by its ID
+    const expiredIds = expired.map((s) => s.id);
+    const { data: updated, error: updateError } = await supabase
+      .from("subscriptions")
+      .update({ status: "canceled", updated_at: now })
+      .in("id", expiredIds)
+      .select();
+
+    if (updateError) {
+      console.error("❌ Expire check update error:", updateError);
+      return res.status(500).json({ error: updateError.message });
+    }
+
+    console.log(`🔄 Expired ${updated?.length || 0} subscription(s) for user ${userId}:`, expiredIds);
+    res.json({ expired: updated?.length || 0, subscriptions: updated });
+  } catch (err) {
+    console.error("❌ Expire check error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Route 4: Coach Connect Dashboard Link ────────────────────────────────
 app.post("/api/stripe/connect-dashboard", async (req, res) => {
   const { stripeAccountId } = req.body;
